@@ -1,4 +1,4 @@
-import io
+import os
 import time
 import numpy as np
 import pandas as pd
@@ -12,44 +12,47 @@ IMG_SIZE = (224, 224)
 CONF_WARN = 0.55  
 
 @st.cache_resource
-def load_model(path="chocolate_classifier.keras"):
+def load_model(path: str = "chocolate_classifier.keras"):
+    if not os.path.exists(path):
+        st.stop()
     return tf.keras.models.load_model(path)
 
 @st.cache_data
-def load_label_and_meta(csv_path="label.csv"):
+def load_label_and_meta(csv_path: str = "label.csv"):
     """
-    Supports two formats:
-      A) Mapping CSV: two columns [index,label] (exported from training)
-      B) Per-image CSV: columns [filename,label,price,manufacturer,calories]
+    Expect a per-image CSV with columns:
+      filename,label,price,manufacturer,calories
     Returns:
-      idx_to_label: dict[int -> str]
+      idx_to_label: dict[int -> str]  (alphabetical order of labels)
       meta_by_label: dict[label -> {price, manufacturer, calories}]
     """
-    df = pd.read_csv(csv_path)
+    if not os.path.exists(csv_path):
+        st.error(f"CSV file not found: **{csv_path}**. "
+                 "Make sure it's in the repo root next to app.py.")
+        st.stop()
 
-    
-    if set(df.columns[:2]) >= {"index", "label"} and len(df.columns) <= 3:
-        df = df.dropna(subset=["index", "label"])
-        df["index"] = df["index"].astype(int)
-        idx_to_label = dict(zip(df["index"], df["label"].astype(str)))
-        meta_by_label = {}
-    else:
-        needed = {"filename", "label", "price", "manufacturer", "calories"}
-        if not needed.issubset(set(df.columns)):
-            raise ValueError(
-                "CSV must be either (index,label) mapping or per-image with "
-                "columns: filename,label,price,manufacturer,calories"
-            )
-        meta_by_label = (
-            df.drop_duplicates(subset=["label"])
-              .set_index("label")[["price", "manufacturer", "calories"]]
-              .to_dict(orient="index")
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    needed = {"filename", "label", "price", "manufacturer", "calories"}
+    if not needed.issubset(set(df.columns)):
+        st.error(
+            "CSV schema not recognized. Expected columns:\n"
+            "`filename,label,price,manufacturer,calories`"
         )
-        labels = sorted(meta_by_label.keys())
-        idx_to_label = {i: lbl for i, lbl in enumerate(labels)}
+        st.stop()
+
+    df["label"] = df["label"].astype(str)
+    meta_by_label = (
+        df.drop_duplicates(subset=["label"])
+          .set_index("label")[["price", "manufacturer", "calories"]]
+          .to_dict(orient="index")
+    )
+
+    labels_sorted = sorted(meta_by_label.keys())
+    idx_to_label = {i: lbl for i, lbl in enumerate(labels_sorted)}
 
     return idx_to_label, meta_by_label
-
 
 def preprocess(img_pil: Image.Image) -> np.ndarray:
     img = img_pil.convert("RGB").resize(IMG_SIZE, Image.LANCZOS)
@@ -63,14 +66,17 @@ def predict_one(model, img_pil: Image.Image, idx_to_label: dict):
     pred_label = idx_to_label.get(pred_idx, f"Class_{pred_idx}")
     pred_conf = float(probs[pred_idx])
 
-    
+    # Top-3
     top3_idx = np.argsort(probs)[-3:][::-1]
     top3 = [(idx_to_label.get(int(i), f"Class_{int(i)}"), float(probs[i])) for i in top3_idx]
     return pred_label, pred_conf, top3
 
 
 st.title("🍫 Live Chocolate Classifier")
-st.write("Capture a photo of a chocolate bar (phone or webcam). The app predicts the category and shows **price (BDT)**, **manufacturer**, and **calories**.")
+st.write(
+    "Capture a photo of a chocolate bar (phone or webcam). "
+    "The app predicts the category and shows **price (BDT)**, **manufacturer**, and **calories**."
+)
 
 with st.sidebar:
     st.subheader("Settings")
@@ -79,7 +85,17 @@ with st.sidebar:
 
 
 model = load_model()
-idx_to_label, meta_by_label = load_label_and_meta("class_index_to_label.csv")
+idx_to_label, meta_by_label = load_label_and_meta("label.csv")
+
+
+num_model_classes = model.output_shape[-1]
+num_labels = len(idx_to_label)
+if num_model_classes != num_labels:
+    st.warning(
+        f"Model outputs **{num_model_classes}** classes, but CSV defined **{num_labels}** labels. "
+        "Ensure your label set (alphabetical) matches the training class order."
+    )
+
 
 tabs = st.tabs(["📷 Camera", "📁 Upload"])
 image = None
@@ -98,6 +114,7 @@ if image is None:
     st.info("Use **Camera** to capture or **Upload** an image to get started.")
     st.stop()
 
+
 st.image(image, caption="Input image", use_container_width=True)
 
 with st.spinner("Predicting…"):
@@ -106,6 +123,7 @@ with st.spinner("Predicting…"):
     latency = (time.time() - t0) * 1000
 
 st.success(f"**Prediction:** {label}  \n**Confidence:** {conf*100:.2f}%  \n_latency: {latency:.1f} ms_")
+
 
 info = meta_by_label.get(label)
 col1, col2, col3 = st.columns(3)
@@ -117,10 +135,10 @@ else:
     col1.metric("Price (BDT)", "N/A")
     col2.metric("Manufacturer", "N/A")
     col3.metric("Calories", "N/A")
-    st.caption("No per-label metadata found in CSV. If you used an index→label mapping file, add a per-image CSV or a separate labels.csv and adapt loader.")
+    st.caption("No per-label metadata found in CSV for this label.")
 
 if conf < CONF_WARN:
-    st.warning("Low confidence. Try better lighting, move closer, or reduce glare.")
+    st.warning("Low confidence. Try better lighting, remove glare, or move closer to the bar.")
 
 if show_top3:
     st.subheader("Top-3 predictions")
